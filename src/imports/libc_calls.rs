@@ -1091,6 +1091,32 @@ pub fn handler(name: &str) -> Option<Handler> {
                 i += 1;
             }
         }),
+        "wcscat" => handler!(|uc, a| {
+            let (destination, source) = (a.u32(), a.u32());
+            let m = mem();
+            let mut end = destination;
+            while m.read_u32(end) != 0 {
+                end += 4;
+            }
+            let mut i = 0;
+            loop {
+                let c = m.read_u32(source + i * 4);
+                m.write_u32(end + i * 4, c);
+                if c == 0 {
+                    return Ret::U32(destination);
+                }
+                i += 1;
+            }
+        }),
+        "wcsstr" => handler!(|uc, a| {
+            let (text, wanted) = (a.u32(), a.u32());
+            let (haystack, needle) = (guest_wide_text(text), guest_wide_text(wanted));
+            if needle.is_empty() {
+                return Ret::U32(text);
+            }
+            let found = haystack.windows(needle.len()).position(|window| window == needle.as_slice());
+            Ret::U32(found.map_or(0, |at| text + at as u32 * 4))
+        }),
         "strerror" => handler!(|uc, a| {
             let number = a.i32();
             let text = std::io::Error::from_raw_os_error(number).to_string();
