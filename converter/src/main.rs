@@ -28,6 +28,7 @@
 //!        apk-convert --inspect <game.apk|bundle> [--base <out.apk>] [--work <scratch dir>]
 //! (`--abi x86_64` makes a copy for the PC's Android emulator, with an x86_64 bridge and stand-in.)
 //! (`--min-target-sdk N` raises the game's target Android version to N: phones without root refuse older ones.)
+//! (`--max-aspect 16:9` keeps an old game's picture at that shape on wider phones; Android adds black bars.)
 //! (`--offline-pack folder` makes the game play offline: its servers are answered on the phone from the folder, offline.rs.)
 //! `--inspect` only looks: it prints `kind apk|bundle`, `data yes|no` for a bundle (carries game data),
 //! `download yes|no` (the game's own code starts Google Play's expansion-file download, and doesn't download
@@ -87,6 +88,8 @@ struct Options {
     abi: String,
     /// Raise the game's target Android version to at least this (phones without root refuse older ones).
     min_target_sdk: Option<u32>,
+    /// Keep the game's picture no wider than this (long side / short side); Android adds black bars.
+    max_aspect: Option<f32>,
     /// The game's offline pack folder (offline.rs): its servers are answered on the phone.
     offline_pack: Option<PathBuf>,
 }
@@ -102,6 +105,7 @@ fn parse() -> Result<Command, String> {
     let (mut bridge, mut standin, mut work, mut abi, mut base, mut pacer) = (None, None, None, None, None, None);
     let mut min_target_sdk = None;
     let mut offline_pack = None;
+    let mut max_aspect = None;
     let mut inspect = false;
     while let Some(argument) = arguments.next() {
         let mut value = || arguments.next().ok_or(format!("{argument} needs a value"));
@@ -117,6 +121,15 @@ fn parse() -> Result<Command, String> {
                 min_target_sdk = Some(text.parse().map_err(|_| format!("--min-target-sdk needs a number, not {text}"))?);
             }
             "--offline-pack" => offline_pack = Some(PathBuf::from(value()?)),
+            "--max-aspect" => {
+                let text = value()?;
+                let ratio = text
+                    .split_once(':')
+                    .and_then(|(long, short)| Some(long.parse::<f32>().ok()? / short.parse::<f32>().ok()?));
+                max_aspect = Some(
+                    ratio.filter(|ratio| *ratio >= 1.0).ok_or(format!("--max-aspect needs a shape like 16:9, not {text}"))?,
+                );
+            }
             "--inspect" => inspect = true,
             _ if argument.starts_with("--") => return Err(format!("unknown option {argument}")),
             _ => positional.push(PathBuf::from(argument)),
@@ -137,6 +150,7 @@ fn parse() -> Result<Command, String> {
         work,
         abi: abi.unwrap_or_else(|| "arm64-v8a".into()),
         min_target_sdk,
+        max_aspect,
         offline_pack,
     }))
 }
@@ -535,6 +549,16 @@ fn rewrite<R: Read + Seek>(
                         Ok(Some((old, new))) => println!("fix {name}: target Android version (Android refuses games made for older versions): {old} -> {new}"),
                         Ok(None) => {}
                         Err(reason) => println!("warn {name}: can't raise the target Android version: {reason}"),
+                    }
+                }
+                if let Some(ratio) = options.max_aspect {
+                    match manifest::limit_aspect(&bytes, ratio) {
+                        Ok(changed) if changed != bytes => {
+                            println!("fix {name}: picture no wider than {ratio:.3}:1 (Android adds black bars on wider screens)");
+                            bytes = changed;
+                        }
+                        Ok(_) => println!("warn {name}: the game already sets its widest shape; left as it is"),
+                        Err(reason) => println!("warn {name}: can't limit the picture's shape: {reason}"),
                     }
                 }
                 if let Some(icons) = &round_icons {

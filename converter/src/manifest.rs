@@ -15,6 +15,9 @@
 //! so the converter can add one to set things up first. Adding one rebuilds
 //! the file: new strings go at the end of the string pool, so the numbers of
 //! the old strings (which the rest of the file refers to) stay the same.
+//!
+//! `android.max_aspect`: an old game laid out for 16:9 can be kept at that
+//! shape on a wider phone (`limit_aspect`); Android adds the black bars.
 
 /// Resource ID of the android:extractNativeLibs attribute.
 const EXTRACT_NATIVE_LIBS: u32 = 0x0101_04ea;
@@ -24,6 +27,7 @@ const RES_XML_RESOURCE_MAP_TYPE: u16 = 0x0180;
 const RES_XML_START_ELEMENT_TYPE: u16 = 0x0102;
 const RES_XML_END_ELEMENT_TYPE: u16 = 0x0103;
 const TYPE_STRING: u8 = 0x03;
+const TYPE_FLOAT: u8 = 0x04;
 const TYPE_INT_BOOLEAN: u8 = 0x12;
 const TYPE_INT_DEC: u8 = 0x10;
 const TYPE_INT_HEX: u8 = 0x11;
@@ -36,6 +40,9 @@ const NAME: u32 = 0x0101_0003;
 const EXPORTED: u32 = 0x0101_0010;
 const AUTHORITIES: u32 = 0x0101_0018;
 const INIT_ORDER: u32 = 0x0101_001a;
+/// Resource IDs of android:value and android:resizeableActivity.
+const VALUE: u32 = 0x0101_0024;
+const RESIZEABLE_ACTIVITY: u32 = 0x0101_04f6;
 const ANDROID_NAMESPACE: &str = "http://schemas.android.com/apk/res/android";
 /// String pool flags: strings are UTF-8 (else UTF-16), and strings are sorted.
 const UTF8_FLAG: u32 = 0x100;
@@ -381,6 +388,15 @@ fn string_number(strings: &mut Vec<String>, text: &str) -> u32 {
     }
 }
 
+/// A value for an attribute the converter adds.
+#[derive(Clone, Copy)]
+enum Value<'a> {
+    Text(&'a str),
+    Bool(bool),
+    Int(u32),
+    Float(f32),
+}
+
 /// Adds `<provider android:name=class android:authorities=authority
 /// android:exported="false" android:initOrder="2147483647"/>` as the first
 /// thing inside `<application>`. The highest init order makes Android start
@@ -388,10 +404,46 @@ fn string_number(strings: &mut Vec<String>, text: &str) -> u32 {
 /// provider with this name is already there, so converting twice is safe.
 /// Err when the file isn't compiled XML or has no `<application>`.
 pub fn add_provider(data: &[u8], class: &str, authority: &str) -> Result<Vec<u8>, &'static str> {
-    let not_xml = "the manifest isn't compiled XML";
     if class.len() > 0x7fff || authority.len() > 0x7fff {
         return Err("the provider's name is too long");
     }
+    let attributes = [
+        ("name", NAME, Value::Text(class)),
+        ("exported", EXPORTED, Value::Bool(false)),
+        ("authorities", AUTHORITIES, Value::Text(authority)),
+        ("initOrder", INIT_ORDER, Value::Int(i32::MAX as u32)),
+    ];
+    add_to_application(data, "provider", &attributes, &[])
+}
+
+/// Keeps the game's picture no wider than `ratio` (long side / short side):
+/// Android centres it and leaves the rest of a wider screen black. Adds
+/// `<meta-data android:name="android.max_aspect" android:value=ratio/>` and
+/// sets android:resizeableActivity="false" on `<application>` (Android only
+/// applies the limit to apps that can't be resized). Returns the file
+/// unchanged when it already carries a limit.
+pub fn limit_aspect(data: &[u8], ratio: f32) -> Result<Vec<u8>, &'static str> {
+    let attributes = [("name", NAME, Value::Text("android.max_aspect")), ("value", VALUE, Value::Float(ratio))];
+    let on_application = [("resizeableActivity", RESIZEABLE_ACTIVITY, Value::Bool(false))];
+    add_to_application(data, "meta-data", &attributes, &on_application)
+}
+
+/// Adds `<element attributes.../>` as the first thing inside `<application>`
+/// and sets the `on_application` attributes on `<application>` itself.
+/// Attributes are (name, resource ID, value), sorted by ID; the element's
+/// first one is its android:name. Returns the file unchanged when an
+/// `element` with that name is already there. Err when the file isn't
+/// compiled XML or has no `<application>`.
+fn add_to_application(
+    data: &[u8],
+    element: &str,
+    attributes: &[(&str, u32, Value)],
+    on_application: &[(&str, u32, Value)],
+) -> Result<Vec<u8>, &'static str> {
+    let not_xml = "the manifest isn't compiled XML";
+    let Some(&(_, _, Value::Text(element_name))) = attributes.first() else {
+        return Err("the added element has no name");
+    };
     if u16_at(data, 0) != Some(0x0003) {
         return Err(not_xml);
     }
@@ -436,9 +488,9 @@ pub fn add_provider(data: &[u8], class: &str, authority: &str) -> Result<Vec<u8>
             RES_XML_START_ELEMENT_TYPE => {
                 let name = text(u32_at(data, body + 4).ok_or(not_xml)?);
                 if name == Some("application") && application.is_none() {
-                    application = Some((at + size, u32_at(data, at + 8).ok_or(not_xml)?));
+                    application = Some((at, header_size, size, u32_at(data, at + 8).ok_or(not_xml)?));
                 }
-                if name != Some("provider") {
+                if name != Some(element) {
                     continue;
                 }
                 let attribute_start = u16_at(data, body + 8).ok_or(not_xml)? as usize;
@@ -454,7 +506,7 @@ pub fn add_provider(data: &[u8], class: &str, authority: &str) -> Result<Vec<u8>
                         Some(&TYPE_STRING) => u32_at(data, attribute + 16),
                         _ => u32_at(data, attribute + 8),
                     };
-                    if value.and_then(text) == Some(class) {
+                    if value.and_then(text) == Some(element_name) {
                         return Ok(data.to_vec());
                     }
                 }
@@ -463,16 +515,16 @@ pub fn add_provider(data: &[u8], class: &str, authority: &str) -> Result<Vec<u8>
         }
     }
     let android = android.ok_or("the manifest doesn't declare the android namespace")?;
-    let (application_end, line) = application.ok_or("the manifest has no <application>")?;
+    let (application_at, application_header, application_size, line) = application.ok_or("the manifest has no <application>")?;
+    let application_end = application_at + application_size;
 
     // Attribute names need their resource ID in the resource map. An old
     // string only counts if the map gives it the right ID; otherwise a new
     // copy goes at the end and the map grows to reach it.
     let mut strings = pool.strings.clone();
     let mut new_resource_ids = resource_ids.clone();
-    let mut names = [0u32; 4];
-    let wanted = [("name", NAME), ("exported", EXPORTED), ("authorities", AUTHORITIES), ("initOrder", INIT_ORDER)];
-    for (slot, (name, id)) in names.iter_mut().zip(wanted) {
+    let mut names = Vec::new();
+    for &(name, id, _) in attributes.iter().chain(on_application) {
         let number = match (0..strings.len()).find(|&i| strings[i] == name && resource_ids.get(i) == Some(&id)) {
             Some(number) => number,
             None => {
@@ -484,23 +536,33 @@ pub fn add_provider(data: &[u8], class: &str, authority: &str) -> Result<Vec<u8>
             new_resource_ids.resize(number + 1, 0);
         }
         new_resource_ids[number] = id;
-        *slot = number as u32;
+        names.push(number as u32);
     }
-    let provider = string_number(&mut strings, "provider");
-    let class = string_number(&mut strings, class);
-    let authority = string_number(&mut strings, authority);
+    let element = string_number(&mut strings, element);
+    let built: Vec<Attribute> = attributes
+        .iter()
+        .chain(on_application)
+        .zip(&names)
+        .map(|(&(_, _, value), &name)| match value {
+            Value::Text(text) => {
+                let number = string_number(&mut strings, text);
+                (android, name, number, TYPE_STRING, number)
+            }
+            Value::Bool(on) => (android, name, NO_STRING, TYPE_INT_BOOLEAN, if on { u32::MAX } else { 0 }),
+            Value::Int(number) => (android, name, NO_STRING, TYPE_INT_DEC, number),
+            Value::Float(number) => (android, name, NO_STRING, TYPE_FLOAT, number.to_bits()),
+        })
+        .collect();
+    let (element_attributes, application_attributes) = built.split_at(attributes.len());
 
-    let mut provider_chunks = start_element(
-        line,
-        provider,
-        &[
-            (android, names[0], class, TYPE_STRING, class),
-            (android, names[1], NO_STRING, TYPE_INT_BOOLEAN, 0),
-            (android, names[2], authority, TYPE_STRING, authority),
-            (android, names[3], NO_STRING, TYPE_INT_DEC, i32::MAX as u32),
-        ],
-    );
-    provider_chunks.extend(end_element(line, provider));
+    let mut element_chunks = start_element(line, element, element_attributes);
+    element_chunks.extend(end_element(line, element));
+
+    let mut application_chunk = data[application_at..application_end].to_vec();
+    for (attribute, &(_, id, _)) in application_attributes.iter().zip(on_application) {
+        set_attribute(&mut application_chunk, application_header, &new_resource_ids, id, *attribute)
+            .ok_or("the manifest's <application> has an unknown layout")?;
+    }
 
     let pool_chunk = if strings.len() == pool.strings.len() {
         data[pool.at..pool.at + pool.size].to_vec()
@@ -524,17 +586,70 @@ pub fn add_provider(data: &[u8], class: &str, authority: &str) -> Result<Vec<u8>
             }
         } else if Some(at) == map_chunk.map(|chunk| chunk.0) {
             out.extend_from_slice(&map);
+        } else if at == application_at {
+            out.extend_from_slice(&application_chunk);
         } else {
             out.extend_from_slice(&data[at..at + size]);
         }
         if at + size == application_end {
-            out.extend_from_slice(&provider_chunks);
+            out.extend_from_slice(&element_chunks);
         }
     }
     out.extend_from_slice(&data[tail..]);
     let size = out.len() as u32;
     put_u32(&mut out, 4, size);
     Ok(out)
+}
+
+/// Sets attribute `id` of a start element chunk: its value is replaced if
+/// the element has it, else it is added where its ID sorts (attributes are
+/// ordered by resource ID, ones without an ID last). None if the chunk's
+/// attributes aren't the usual 20 bytes each.
+fn set_attribute(chunk: &mut Vec<u8>, header_size: usize, resource_ids: &[u32], id: u32, attribute: Attribute) -> Option<()> {
+    let body = header_size;
+    let attribute_start = body + u16_at(chunk, body + 8)? as usize;
+    if u16_at(chunk, body + 10)? != 20 {
+        return None;
+    }
+    let count = u16_at(chunk, body + 12)? as usize;
+    let (namespace, name, raw, kind, value) = attribute;
+    let mut bytes = Vec::new();
+    for field in [namespace, name, raw] {
+        bytes.extend_from_slice(&field.to_le_bytes());
+    }
+    bytes.extend_from_slice(&8u16.to_le_bytes());
+    bytes.extend_from_slice(&[0, kind]);
+    bytes.extend_from_slice(&value.to_le_bytes());
+
+    let mut position = count;
+    for i in 0..count {
+        let at = attribute_start + i * 20;
+        let existing = resource_ids.get(u32_at(chunk, at + 4)? as usize).copied().unwrap_or(0);
+        if existing == id {
+            chunk.get_mut(at..at + 20)?.copy_from_slice(&bytes);
+            return Some(());
+        }
+        if existing == 0 || existing > id {
+            position = i;
+            break;
+        }
+    }
+    let at = attribute_start + position * 20;
+    if at > chunk.len() {
+        return None;
+    }
+    chunk.splice(at..at, bytes);
+    let size = chunk.len() as u32;
+    put_u32(chunk, 4, size);
+    chunk[body + 12..body + 14].copy_from_slice(&(count as u16 + 1).to_le_bytes());
+    // The id, class and style attributes are named by position (1-based).
+    for field in [body + 14, body + 16, body + 18] {
+        let index = u16_at(chunk, field)?;
+        if index as usize > position {
+            chunk[field..field + 2].copy_from_slice(&(index + 1).to_le_bytes());
+        }
+    }
+    Some(())
 }
 
 #[cfg(test)]
