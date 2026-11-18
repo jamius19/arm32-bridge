@@ -10,8 +10,10 @@ fn main() {
     let ndk = std::env::var("NDK").map(PathBuf::from).unwrap_or_else(|_| {
         PathBuf::from(std::env::var("HOME").unwrap()).join("Android/Sdk/ndk/30.0.16248370")
     });
-    let toolchain = ndk.join("toolchains/llvm/prebuilt/linux-x86_64");
-    let clang = toolchain.join("bin/armv7a-linux-androideabi21-clang");
+    let host = if cfg!(windows) { "windows-x86_64" } else { "linux-x86_64" };
+    let toolchain = ndk.join("toolchains/llvm/prebuilt").join(host);
+    // On Windows the armv7a-...-clang wrapper is a .cmd file, which can't be run directly.
+    let clang = toolchain.join("bin/clang");
     let static_libraries = toolchain.join("sysroot/usr/lib/arm-linux-androideabi");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("guest");
     std::fs::create_dir_all(&out).unwrap();
@@ -20,7 +22,7 @@ fn main() {
     let archive = static_libraries.join("libz.a");
     println!("cargo:rerun-if-changed={}", archive.display());
     let status = Command::new(&clang)
-        .args(["-shared", "-fPIC", "-Wl,-soname,libz.so", "-Wl,--whole-archive"])
+        .args(["--target=armv7a-linux-androideabi21", "-shared", "-fPIC", "-Wl,-soname,libz.so", "-Wl,--whole-archive"])
         .arg(&archive)
         .args(["-Wl,--no-whole-archive", "-o"])
         .arg(out.join("libz.so"))

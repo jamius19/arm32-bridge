@@ -26,6 +26,9 @@ thread_local! {
     static HOST_ENV: Cell<*mut JNIEnv> = const { Cell::new(std::ptr::null_mut()) };
     static ATTACHED_BY_US: Cell<bool> = const { Cell::new(false) };
     static LOCAL_FRAMES: RefCell<Vec<Vec<u32>>> = const { RefCell::new(Vec::new()) };
+    /// Per native call: Java direct buffers handed to the game as a guest copy,
+    /// (host address, guest copy, bytes), copied back when the call returns.
+    static DIRECT_FRAMES: RefCell<Vec<Vec<(usize, u32, u32)>>> = const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Clone)]
@@ -44,6 +47,9 @@ pub struct Refs {
     /// Guest copies of strings/arrays handed out by Get*Chars/Get*Elements:
     /// guest pointer → (host pointer, element bytes, length in elements).
     copies: HashMap<u32, (usize, u32, u32)>,
+    /// Guest copies of Java direct buffers that live outside guest memory:
+    /// host address → (guest copy, bytes).
+    direct_buffers: HashMap<usize, (u32, u32)>,
 }
 
 pub fn set_vm(vm: *mut JavaVM) {
@@ -90,11 +96,16 @@ pub struct Entry {
 pub fn enter(env: *mut JNIEnv) -> Entry {
     let previous_env = HOST_ENV.with(|e| e.replace(env));
     LOCAL_FRAMES.with(|f| f.borrow_mut().push(Vec::new()));
+    DIRECT_FRAMES.with(|f| f.borrow_mut().push(Vec::new()));
     Entry { previous_env }
 }
 
 impl Drop for Entry {
     fn drop(&mut self) {
+        // What the game wrote into its copies of Java's direct buffers goes back to Java.
+        for (host, guest, size) in DIRECT_FRAMES.with(|f| f.borrow_mut().pop()).unwrap_or_default() {
+            unsafe { std::ptr::copy_nonoverlapping(mem().host(guest), host as *mut u8, size as usize) };
+        }
         let frame = LOCAL_FRAMES.with(|f| f.borrow_mut().pop()).unwrap_or_default();
         let mut shared = shared();
         for handle in frame {
@@ -835,10 +846,42 @@ pub fn dispatch(uc: &mut Uc, name: &str, a: &mut Args) -> Ret {
             Ret::U32(to_guest(jcall!(env, NewDirectByteBuffer, mem().host(address) as *mut c_void, capacity)))
         }
         "GetDirectBufferAddress" => {
-            let host = jcall!(env, GetDirectBufferAddress, to_host(a.u32())) as *const u8;
+            let buffer = to_host(a.u32());
+            let host = jcall!(env, GetDirectBufferAddress, buffer) as *const u8;
             let memory = mem();
             let offset = (host as usize).wrapping_sub(memory.host(0) as usize);
-            Ret::U32(if offset < (1usize << 32) { offset as u32 } else { 0 })
+            if host.is_null() || offset < (1usize << 32) {
+                return Ret::U32(if host.is_null() { 0 } else { offset as u32 });
+            }
+            // A buffer Java allocated (FMOD Ex's sound thread: ByteBuffer.allocateDirect)
+            // is outside the game's 32-bit memory: the game works on a copy, which
+            // is copied back when the native call returns.
+            let size = jcall!(env, GetDirectBufferCapacity, buffer).clamp(0, u32::MAX as i64) as u32;
+            let guest = {
+                let mut shared = shared();
+                match shared.state.jni_refs.direct_buffers.get(&(host as usize)) {
+                    Some(&(guest, known)) if known >= size => guest,
+                    _ => {
+                        let guest = shared.misc_alloc(size.max(1), 16);
+                        shared.state.jni_refs.direct_buffers.insert(host as usize, (guest, size));
+                        guest
+                    }
+                }
+            };
+            unsafe { std::ptr::copy_nonoverlapping(host, memory.host(guest), size as usize) };
+            let in_native_call = DIRECT_FRAMES.with(|f| match f.borrow_mut().last_mut() {
+                Some(frame) => {
+                    if !frame.iter().any(|entry| entry.0 == host as usize) {
+                        frame.push((host as usize, guest, size));
+                    }
+                    true
+                }
+                None => false,
+            });
+            if !in_native_call {
+                crate::log::line("[bridge] GetDirectBufferAddress outside a native call: the game's writes won't reach Java");
+            }
+            Ret::U32(guest)
         }
         "GetDirectBufferCapacity" => Ret::U64(jcall!(env, GetDirectBufferCapacity, to_host(a.u32())) as u64),
         "GetObjectRefType" => Ret::U32(jcall!(env, GetObjectRefType, to_host(a.u32())) as u32),
